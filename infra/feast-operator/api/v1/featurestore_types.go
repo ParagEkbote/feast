@@ -111,6 +111,35 @@ type OpenLineageConfig struct {
 	// Keys must be valid Feast OpenLineageConfig YAML field names.
 	// +optional
 	ExtraConfig map[string]string `json:"extraConfig,omitempty"`
+	// Consumer configures the OpenLineage consumer (event receiver) that enables
+	// Feast to receive and display lineage from external producers (Airflow, Spark, dbt, etc.).
+	// +optional
+	Consumer *OpenLineageConsumerConfig `json:"consumer,omitempty"`
+}
+
+// OpenLineageConsumerConfig configures the OpenLineage consumer (event receiver).
+// When enabled, the Feast REST server exposes POST /api/v1/lineage to receive
+// OpenLineage events from any producer, storing them for visualization in the Feast UI.
+type OpenLineageConsumerConfig struct {
+	// Enable the OpenLineage consumer.
+	Enabled bool `json:"enabled"`
+	// StoreType is the storage backend for lineage events. Currently only "sql" is supported.
+	// +kubebuilder:default="sql"
+	// +kubebuilder:validation:Enum=sql
+	// +optional
+	StoreType *string `json:"storeType,omitempty"`
+	// Reference to a Secret containing the key "connection_string" for a separate
+	// lineage database. If omitted, the SQL registry database is reused.
+	// +optional
+	ConnectionStringSecretRef *corev1.LocalObjectReference `json:"connectionStringSecretRef,omitempty"`
+	// Reference to a Secret containing the key "api_key" that producers must
+	// provide in the X-API-Key header when sending events.
+	// +optional
+	ApiKeySecretRef *corev1.LocalObjectReference `json:"apiKeySecretRef,omitempty"`
+	// NamespaceMapping maps OpenLineage namespaces to Feast projects for
+	// RBAC-based filtering of lineage data in the UI.
+	// +optional
+	NamespaceMapping map[string]string `json:"namespaceMapping,omitempty"`
 }
 
 // FeatureStoreSpec defines the desired state of FeatureStore
@@ -127,6 +156,9 @@ type FeatureStoreSpec struct {
 	AuthzConfig     *AuthzConfig          `json:"authz,omitempty"`
 	CronJob         *FeastCronJob         `json:"cronJob,omitempty"`
 	BatchEngine     *BatchEngineConfig    `json:"batchEngine,omitempty"`
+	// DataQualityMonitoring configures Data Quality Monitoring behaviour.
+	// +optional
+	DataQualityMonitoring *DataQualityMonitoringConfig `json:"dataQualityMonitoring,omitempty"`
 	// Replicas is the desired number of pod replicas. Used by the scale sub-resource.
 	// Mutually exclusive with services.scaling.autoscaling.
 	// +kubebuilder:default=1
@@ -170,7 +202,7 @@ type GitCloneOptions struct {
 type FeastInitOptions struct {
 	Minimal bool `json:"minimal,omitempty"`
 	// Template for the created project
-	// +kubebuilder:validation:Enum=local;gcp;aws;snowflake;spark;postgres;hbase;cassandra;hazelcast;couchbase;clickhouse
+	// +kubebuilder:validation:Enum=local;gcp;aws;snowflake;spark;postgres;hbase;cassandra;hazelcast;couchbase;clickhouse;milvus;ray;ray_rag;pytorch_nlp
 	Template string `json:"template,omitempty"`
 }
 
@@ -227,6 +259,13 @@ type BatchEngineConfig struct {
 	ConfigMapRef *corev1.LocalObjectReference `json:"configMapRef,omitempty"`
 	// Key name in the ConfigMap. Defaults to "config" if not specified.
 	ConfigMapKey string `json:"configMapKey,omitempty"`
+}
+
+// DataQualityMonitoringConfig defines the Data Quality Monitoring configuration.
+type DataQualityMonitoringConfig struct {
+	// AutoBaseline controls whether baseline distribution is computed automatically on feast apply. Defaults to true.
+	// +kubebuilder:default=true
+	AutoBaseline *bool `json:"autoBaseline,omitempty"`
 }
 
 // JobSpec describes how the job execution will look like.
@@ -390,6 +429,17 @@ type FeatureStoreServices struct {
 	// pod anti-affinity rule to prefer spreading pods across nodes.
 	// +optional
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+	// ResourceClaims defines which ResourceClaims must be allocated
+	// and reserved before the Pod is allowed to start. The resources
+	// will be made available to those containers which consume them
+	// by name.
+	//
+	// +patchMergeKey=name
+	// +patchStrategy=merge,retainKeys
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ResourceClaims []corev1.PodResourceClaim `json:"resourceClaims,omitempty" patchStrategy:"merge,retainKeys" patchMergeKey:"name"`
 }
 
 // ScalingConfig configures horizontal scaling for the FeatureStore deployment.
@@ -576,7 +626,7 @@ type OnlineStoreFilePersistence struct {
 // OnlineStoreDBStorePersistence configures the DB store persistence for the online store service
 type OnlineStoreDBStorePersistence struct {
 	// Type of the persistence type you want to use.
-	// +kubebuilder:validation:Enum=snowflake.online;redis;datastore;dynamodb;bigtable;postgres;cassandra;mysql;hazelcast;singlestore;hbase;elasticsearch;qdrant;couchbase.online;milvus;hybrid;mongodb
+	// +kubebuilder:validation:Enum=snowflake.online;redis;datastore;dynamodb;bigtable;postgres;cassandra;mysql;hazelcast;singlestore;hbase;elasticsearch;qdrant;couchbase.online;milvus;hybrid;mongodb;aerospike;scylladb
 	Type string `json:"type"`
 	// Data store parameters should be placed as-is from the "feature_store.yaml" under the secret key. "registry_type" & "type" fields should be removed.
 	SecretRef corev1.LocalObjectReference `json:"secretRef"`
@@ -602,6 +652,8 @@ var ValidOnlineStoreDBStorePersistenceTypes = []string{
 	"milvus",
 	"hybrid",
 	"mongodb",
+	"aerospike",
+	"scylladb",
 }
 
 // LocalRegistryConfig configures the registry service

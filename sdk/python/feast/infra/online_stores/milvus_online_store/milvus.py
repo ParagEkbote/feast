@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-from pydantic import StrictStr
+from pydantic import StrictStr, field_validator
 from pymilvus import (
     CollectionSchema,
     DataType,
@@ -115,6 +115,14 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     nlist: Optional[int] = 128
     username: Optional[StrictStr] = ""
     password: Optional[StrictStr] = ""
+    varchar_max_length: Optional[int] = 65535
+
+    @field_validator("varchar_max_length")
+    @classmethod
+    def validate_varchar_max_length(cls, v):
+        if v is not None and not (1 <= v <= 65535):
+            raise ValueError(f"varchar_max_length must be between 1 and 65535, got {v}")
+        return v
 
 
 class MilvusOnlineStore(OnlineStore):
@@ -125,8 +133,10 @@ class MilvusOnlineStore(OnlineStore):
         _collections: Dictionary to cache Milvus collections.
     """
 
-    client: Optional[MilvusClient] = None
-    _collections: Dict[str, Any] = {}
+    def __init__(self):
+        super().__init__()
+        self.client: Optional[MilvusClient] = None
+        self._collections: Dict[str, Any] = {}
 
     def _get_db_path(self, config: RepoConfig) -> str:
         assert (
@@ -171,12 +181,12 @@ class MilvusOnlineStore(OnlineStore):
         if collection_name not in self._collections:
             # Create a composite key by combining entity fields
             composite_key_name = _get_composite_key_name(table)
-
+            varchar_max_length = int(config.online_store.varchar_max_length or 65535)
             fields = [
                 FieldSchema(
                     name=composite_key_name,
                     dtype=DataType.VARCHAR,
-                    max_length=512,
+                    max_length=varchar_max_length,
                     is_primary=True,
                 ),
                 FieldSchema(name="event_ts", dtype=DataType.INT64),
@@ -203,14 +213,40 @@ class MilvusOnlineStore(OnlineStore):
                             )
                         )
                     else:
+                        if "max_length" in field.tags:
+                            try:
+                                field_max_length = int(field.tags["max_length"])
+                            except (ValueError, TypeError):
+                                raise ValueError(
+                                    f"Field '{field.name}' has invalid max_length tag"
+                                    f" '{field.tags['max_length']}': must be an integer."
+                                )
+                            if not (1 <= field_max_length <= 65535):
+                                raise ValueError(
+                                    f"Field '{field.name}' max_length tag must be"
+                                    f" between 1 and 65535, got {field_max_length}"
+                                )
+                        else:
+                            field_max_length = varchar_max_length
                         fields.append(
                             FieldSchema(
                                 name=field.name,
                                 dtype=DataType.VARCHAR,
-                                max_length=512,
+                                max_length=field_max_length,
                             )
                         )
-
+            has_vector_field = any(
+                f.dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR)
+                for f in fields
+            )
+            if not has_vector_field:
+                fields.append(
+                    FieldSchema(
+                        name="_placeholder_vector",
+                        dtype=DataType.FLOAT_VECTOR,
+                        dim=1,
+                    )
+                )
             schema = CollectionSchema(
                 fields=fields, description="Feast feature view data"
             )
@@ -321,10 +357,13 @@ class MilvusOnlineStore(OnlineStore):
                 "created_ts": created_ts_int,
             }
             single_entity_record.update(values_dict)
-            # Ensure all required fields exist, setting missing ones to empty strings
+            # Ensure all required fields exist, setting missing ones to defaults
             for field in required_fields:
                 if field not in single_entity_record:
-                    single_entity_record[field] = ""
+                    if field == "_placeholder_vector":
+                        single_entity_record[field] = [float("nan")]
+                    else:
+                        single_entity_record[field] = ""
             # Store only the latest event timestamp per entity
             if (
                 entity_key_str not in unique_entities

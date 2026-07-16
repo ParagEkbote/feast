@@ -35,9 +35,11 @@ When the server processes a `get_online_features()` call, it groups the requeste
 **Redis exception:** The Redis online store overrides `get_online_features()` to batch all `HMGET` commands across every feature view into a **single pipeline execution**. Because all feature views for the same entity share one Redis hash key, the number of Redis round trips is always **1**, regardless of how many feature views the request touches. This means the "fewer feature views" guideline is less critical for Redis than for other stores — but consolidating feature views still reduces serialization and protobuf overhead at the application layer.
 {% endhint %}
 
-### Feature services are free
+### Feature services are free (and can be faster)
 
 A [Feature Service](../getting-started/concepts/feature-retrieval.md) is a named collection of feature references — it's a convenience grouping, not a separate storage or execution unit. Using a feature service adds only a registry lookup (cached) compared to listing features individually. There is no performance penalty for using feature services, and they are the recommended way to define stable, versioned feature sets for production models.
+
+For latency-critical services, feature services also unlock **pre-computed feature vectors** (`precompute_online=True`), which reduce store reads from O(N feature views) to O(1). See the [Pre-computed feature vectors](#pre-computed-feature-vectors) section below for details and benchmarks.
 
 ### ODFV overhead is additive
 
@@ -80,6 +82,45 @@ Requesting just `combined_score` triggers reads from **both** `driver_stats_fv` 
 | Prefer `write_to_online_store=True` for ODFVs that don't need request-time data | Moves compute from serving to materialization path |
 | Audit ODFV source dependencies | Avoid pulling in unnecessary store reads via unused source feature views |
 | Use `track_metrics=True` on ODFVs during profiling | Identifies which transforms are the bottleneck |
+
+---
+
+## Pre-computed feature vectors
+
+When a `get_online_features()` request touches multiple feature views, the server issues a separate store read per feature view. For services spanning 5–15+ feature views, this fan-out dominates latency — even with Redis pipeline batching, the protobuf deserialization and response-building overhead grows linearly with the number of views.
+
+**Pre-computed feature vectors** solve this by storing all of a feature service's features for each entity as a single serialized blob. At read time, the server fetches one blob per entity instead of N reads per feature view, reducing the operation to O(1).
+
+### How it works
+
+1. **Define** a feature service with `precompute_online=True`:
+
+```python
+benchmark_service = FeatureService(
+    name="benchmark_customer_service",
+    features=[
+        customer_demographics_fv,
+        customer_behavioral_profile,
+        transaction_7d_aggregations,
+        transaction_30d_aggregations,
+        transaction_90d_patterns,
+        atm_usage_30d,
+    ],
+    precompute_online=True,
+)
+```
+
+2. **Apply** the feature service: `feast apply`
+3. **Materialize** as usual — vectors are built automatically: `feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")`
+4. **Read** features as usual — the server automatically uses the pre-computed path:
+
+```python
+features = store.get_online_features(
+    features=store.get_feature_service("benchmark_customer_service"),
+    entity_rows=[{"customer_id": "CUST_000001"}],
+    full_feature_names=True,
+)
+```
 
 ---
 
@@ -237,6 +278,7 @@ The online store is the single largest factor in `get_online_features()` latency
 | **DynamoDB** | 2–5 ms | Yes | Serverless, auto-scaling on AWS | Pay-per-request cost; batch API limits (100 items) |
 | **PostgreSQL** | 3–10 ms | No (threadpool) | Teams with existing Postgres infra | Connection pooling needed at scale |
 | **MongoDB** | 2–5 ms | Yes | Flexible schema, async-native | Requires index tuning for large datasets |
+| **Aerospike** | < 1 ms | No (threadpool) | Ultra-low latency, hybrid memory (RAM + SSD), large datasets | Namespace must be pre-configured on the cluster |
 | **Bigtable** | 3–8 ms | No (threadpool) | Large-scale GCP workloads | Row-key design affects read performance |
 | **Cassandra / ScyllaDB** | 2–5 ms | No (threadpool) | Multi-region, write-heavy | Tunable consistency; requires DC-aware routing |
 | **Remote** | Varies | No (threadpool) | Centralized feature server architecture | Adds an HTTP hop; tune connection pool |
@@ -264,6 +306,7 @@ The feature server can read from the online store using either an **async** or *
 | **MongoDB** | Yes | Yes | Uses `motor` (async MongoDB driver) |
 | **PostgreSQL** | Implemented | No | Has `online_read_async` but does not yet advertise via `async_supported`; uses sync/threadpool path |
 | **Redis** | Implemented | **Yes** | `online_read_async` and `online_write_batch_async` both implemented; uses sync/threadpool path for `get_online_features` (overridden with batched single pipeline) |
+| **Aerospike** | Implemented | No | Async methods wrap the blocking C client via `run_in_executor`; does not yet advertise via `async_supported`, so the server still uses the threadpool path |
 | All others | No | No | Fall back to sync with `run_in_threadpool()` |
 
 **When async matters most:**
@@ -425,6 +468,34 @@ online_store:
 - **`maxPoolSize` / `minPoolSize`**: Controls the driver connection pool. Default `maxPoolSize` is 100 in PyMongo, but explicitly setting it ensures predictability across versions.
 - **`connectTimeoutMS` / `socketTimeoutMS`**: Tighter timeouts improve p99 by failing fast on slow connections.
 - MongoDB is one of the stores with **full async support** (read and write), so it benefits from concurrent feature view reads via `asyncio.gather()`.
+
+### Aerospike tuning
+
+Aerospike offers sub-millisecond reads thanks to its hybrid-memory architecture (primary index in RAM, data on SSD or RAM). Tune the per-call policies in the Feast config and rely on the Aerospike cluster's own tuning for everything else:
+
+```yaml
+online_store:
+  type: aerospike
+  hosts:
+    - ["aerospike-1.internal", 3000]
+    - ["aerospike-2.internal", 3000]
+  namespace: feast
+  read_timeout_ms: 150           # hard deadline for a single-record get
+  write_timeout_ms: 300           # hard deadline for a single-record put/operate
+  batch_total_timeout_ms: 500     # hard deadline for online_read / online_write_batch
+  socket_timeout_ms: 50           # per-attempt deadline so max_retries can actually fire
+  max_retries: 2
+  ttl_seconds: 86400              # record-level TTL; omit to use the namespace default
+  client_kwargs:                  # escape hatch for any client-config field not surfaced above
+    policies:
+      batch:
+        concurrent_nodes: 0       # 0 = parallel to every node (lowest latency on multi-node clusters)
+```
+
+- **`*_timeout_ms` (total)** vs **`socket_timeout_ms` (per-attempt)**: `*_timeout_ms` is the hard deadline for a whole call *including* retries; `socket_timeout_ms` is the per-attempt deadline that allows `max_retries` to actually fire within that budget. Without `socket_timeout_ms`, a single slow attempt can consume the entire total deadline and retries never run.
+- **`hosts`**: List every seed node. The Aerospike client discovers the rest of the cluster automatically and opens one connection pool per node.
+- **`ttl_seconds: 0`** means "never expire"; omit the key to inherit the namespace's `default-ttl`. Expiry is enforced by the server's `nsup` thread — nothing to delete on the client side.
+- Co-locate the feature server in the **same availability zone / rack** as the Aerospike cluster; sub-millisecond reads are bandwidth- and RTT-sensitive.
 
 ### Remote online store tuning
 
@@ -659,6 +730,7 @@ This applies to every connection-oriented online store:
 | **DynamoDB** | `max_pool_connections` (HTTP pool) | 10 | No hard limit, but AWS SDK has per-process pool caps; monitor throttling |
 | **Redis** | Connection per worker | 1 | `maxclients` on the Redis server (default: 10,000) |
 | **MongoDB** | `maxPoolSize` (in `client_kwargs`) | 100 | Server's `net.maxIncomingConnections` |
+| **Aerospike** | Driver manages pool per seed node | Auto | `proto-fd-max` (default 15000) on each Aerospike node |
 | **Cassandra** | Driver manages pool per node | Auto | `native_transport_max_threads` on each Cassandra node |
 | **Remote** | `connection_pool_size` (HTTP pool) | 50 | The target feature server's worker capacity |
 
@@ -1086,4 +1158,5 @@ Reset `skip_dedup` to `false` (or remove it) after the bulk reload. Under normal
 - [PostgreSQL Online Store](../reference/online-stores/postgres.md) — Connection pooling and SSL configuration
 - [Redis Online Store](../reference/online-stores/redis.md) — Cluster mode, Sentinel, TTL configuration, and batched reads
 - [On Demand Feature Views](../reference/beta-on-demand-feature-view.md) — Transformation modes and write-time transforms
+- [Feature Services & `precompute_online`](../getting-started/concepts/feature-retrieval.md#pre-computed-feature-vectors-precompute_online) — Concept docs for pre-computed feature vectors
 - [feature_store.yaml reference](../reference/feature-repository/feature-store-yaml.md) — Full configuration reference including `materialization` options

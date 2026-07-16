@@ -87,6 +87,9 @@ def test_python_values_to_proto_values_bool(values):
         (np.array([None]), ValueType.BYTES_LIST, None),
         (np.array([None]), ValueType.STRING_LIST, None),
         (np.array([None]), ValueType.UNIX_TIMESTAMP_LIST, None),
+        ([np.array([], dtype=np.int32)], ValueType.INT32_LIST, []),
+        ([np.array([], dtype=np.float32)], ValueType.FLOAT_LIST, []),
+        ([np.array([], dtype=np.bool_)], ValueType.BOOL_LIST, []),
         ([b"[1,2,3]"], ValueType.INT64_LIST, [1, 2, 3]),
         ([b"[1,2,3]"], ValueType.INT32_LIST, [1, 2, 3]),
         ([b"[1.5,2.5,3.5]"], ValueType.FLOAT_LIST, [1.5, 2.5, 3.5]),
@@ -2065,3 +2068,250 @@ class TestValueMapTypes:
         from feast.type_map import PROTO_VALUE_TO_VALUE_TYPE_MAP
 
         assert PROTO_VALUE_TO_VALUE_TYPE_MAP["scalar_map_val"] == ValueType.SCALAR_MAP
+
+
+class TestArrowArrayStringListMaterialization:
+    """Regression tests for Array(String) columns from Arrow/Athena materialization.
+
+    Arrow/Athena deserializes Array(String) feature columns as numpy.ndarray with
+    object dtype. Two bugs were triggered:
+
+    1. ValueError: "The truth value of an empty array is ambiguous"
+       — when an empty ndarray reached the scalar null-check `elif not pd.isnull(value)`.
+
+    2. TypeError: "bad argument type for built-in operation"
+       — when proto_type(val=<ndarray>) was called; protobuf rejects ndarrays.
+
+    Both are fixed by _sanitize_list_value, which converts ndarrays to plain Python
+    lists and replaces None elements with a type-appropriate zero/empty default
+    (see _LIST_NONE_DEFAULTS).
+    """
+
+    def test_sanitize_list_value_ndarray(self):
+        """ndarray is converted to a plain Python list."""
+        from feast.type_map import _sanitize_list_value
+
+        arr = np.array(["foo", "bar"], dtype=object)
+        result = _sanitize_list_value(arr, ValueType.STRING_LIST)
+        assert result == ["foo", "bar"]
+        assert isinstance(result, list)
+
+    def test_sanitize_list_value_empty_ndarray(self):
+        """Empty ndarray is converted to an empty Python list."""
+        from feast.type_map import _sanitize_list_value
+
+        arr = np.array([], dtype=object)
+        result = _sanitize_list_value(arr, ValueType.STRING_LIST)
+        assert result == []
+
+    def test_sanitize_list_value_ndarray_with_none(self):
+        """None elements inside a STRING_LIST ndarray are replaced with empty string."""
+        from feast.type_map import _sanitize_list_value
+
+        arr = np.array(["foo", None, "baz"], dtype=object)
+        result = _sanitize_list_value(arr, ValueType.STRING_LIST)
+        assert result == ["foo", "", "baz"]
+
+    def test_sanitize_list_value_plain_list(self):
+        """Plain Python lists without None pass through unchanged."""
+        from feast.type_map import _sanitize_list_value
+
+        lst = ["foo", "bar"]
+        result = _sanitize_list_value(lst, ValueType.STRING_LIST)
+        assert result == ["foo", "bar"]
+
+    def test_sanitize_list_value_plain_list_with_none(self):
+        """None elements in a STRING_LIST plain list are replaced with empty string."""
+        from feast.type_map import _sanitize_list_value
+
+        lst = ["foo", None]
+        result = _sanitize_list_value(lst, ValueType.STRING_LIST)
+        assert result == ["foo", ""]
+
+    def test_sanitize_list_value_numeric_none_replaced(self):
+        """None elements in numeric lists are replaced with a type-appropriate default."""
+        from feast.type_map import _sanitize_list_value
+
+        assert _sanitize_list_value([1, None, 2], ValueType.INT32_LIST) == [1, 0, 2]
+        assert _sanitize_list_value([1, None, 2], ValueType.INT64_LIST) == [1, 0, 2]
+        assert _sanitize_list_value([1.0, None, 2.0], ValueType.FLOAT_LIST) == [
+            1.0,
+            0.0,
+            2.0,
+        ]
+        assert _sanitize_list_value([1.0, None, 2.0], ValueType.DOUBLE_LIST) == [
+            1.0,
+            0.0,
+            2.0,
+        ]
+        assert _sanitize_list_value([True, None, False], ValueType.BOOL_LIST) == [
+            True,
+            False,
+            False,
+        ]
+
+    def test_sanitize_list_value_bytes_none_replaced(self):
+        """None elements in BYTES_LIST are replaced with b''."""
+        from feast.type_map import _sanitize_list_value
+
+        result = _sanitize_list_value([b"x", None], ValueType.BYTES_LIST)
+        assert result == [b"x", b""]
+
+    def test_sanitize_list_value_scalar_passthrough(self):
+        """Non-list, non-ndarray values are returned unchanged."""
+        from feast.type_map import _sanitize_list_value
+
+        assert _sanitize_list_value("hello", ValueType.STRING_LIST) == "hello"
+        assert _sanitize_list_value(42, ValueType.INT32_LIST) == 42
+
+    def test_string_list_from_ndarray(self):
+        """STRING_LIST column with ndarray values materializes without TypeError."""
+        values = [
+            np.array(["foo", "bar"], dtype=object),
+            np.array(["baz"], dtype=object),
+        ]
+        protos = python_values_to_proto_values(values, ValueType.STRING_LIST)
+        assert len(protos) == 2
+        assert list(protos[0].string_list_val.val) == ["foo", "bar"]
+        assert list(protos[1].string_list_val.val) == ["baz"]
+
+    def test_string_list_from_empty_ndarray(self):
+        """Empty ndarray in a STRING_LIST column must not raise ValueError."""
+        values = [
+            np.array([], dtype=object),
+            np.array(["foo"], dtype=object),
+        ]
+        protos = python_values_to_proto_values(values, ValueType.STRING_LIST)
+        assert list(protos[0].string_list_val.val) == []
+        assert list(protos[1].string_list_val.val) == ["foo"]
+
+    def test_string_list_from_ndarray_with_none_elements(self):
+        """None elements inside an ndarray must not cause TypeError in protobuf."""
+        values = [
+            np.array(["foo", None, "baz"], dtype=object),
+        ]
+        protos = python_values_to_proto_values(values, ValueType.STRING_LIST)
+        # None is replaced with empty string
+        assert list(protos[0].string_list_val.val) == ["foo", "", "baz"]
+
+    def test_string_list_null_row_produces_empty_proto(self):
+        """A None row (missing user) produces an empty ProtoValue."""
+        from feast.protos.feast.types.Value_pb2 import Value as ProtoValue
+
+        values = [
+            None,
+            np.array(["foo"], dtype=object),
+        ]
+        protos = python_values_to_proto_values(values, ValueType.STRING_LIST)
+        assert protos[0] == ProtoValue()
+        assert list(protos[1].string_list_val.val) == ["foo"]
+
+    def test_mixed_batch_simulating_athena_chunk(self):
+        """Simulate a real Athena chunk: mix of ndarray, empty ndarray, and None rows.
+
+        This is the exact scenario that triggered the TypeError during
+        string_list_features materialization.
+        """
+        from feast.protos.feast.types.Value_pb2 import Value as ProtoValue
+
+        # tags / labels column from Athena
+        values = [
+            np.array(["foo", "bar"], dtype=object),  # normal entity
+            np.array([], dtype=object),  # entity with no values set
+            None,  # missing entity (NULL row)
+            np.array(["baz"], dtype=object),  # normal entity
+            np.array(["qux", None], dtype=object),  # entity with partial null
+        ]
+        protos = python_values_to_proto_values(values, ValueType.STRING_LIST)
+
+        assert list(protos[0].string_list_val.val) == ["foo", "bar"]
+        assert list(protos[1].string_list_val.val) == []
+        assert protos[2] == ProtoValue()
+        assert list(protos[3].string_list_val.val) == ["baz"]
+        assert list(protos[4].string_list_val.val) == ["qux", ""]
+
+
+class TestZonedTimestamp:
+    def test_round_trip_preserves_zone(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        dt = datetime(2026, 6, 17, 9, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+        protos = python_values_to_proto_values([dt], ValueType.ZONED_TIMESTAMP)
+        assert protos[0].WhichOneof("val") == "zoned_timestamp_val"
+        assert protos[0].zoned_timestamp_val.zone == "America/Los_Angeles"
+
+        converted = feast_value_type_to_python_type(protos[0])
+        # Same instant AND same wall-clock zone (unlike UNIX_TIMESTAMP, which is UTC).
+        assert converted == dt
+        assert str(converted.tzinfo) == "America/Los_Angeles"
+        assert converted.hour == 9
+
+    def test_distinct_zones_same_instant_are_not_collapsed(self):
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        la = datetime(2026, 6, 17, 9, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+        utc = datetime(2026, 6, 17, 16, 0, 0, tzinfo=timezone.utc)  # same instant
+        protos = python_values_to_proto_values([la, utc], ValueType.ZONED_TIMESTAMP)
+        # Same epoch, different zone preserved.
+        assert (
+            protos[0].zoned_timestamp_val.unix_timestamp
+            == protos[1].zoned_timestamp_val.unix_timestamp
+        )
+        assert protos[0].zoned_timestamp_val.zone == "America/Los_Angeles"
+        assert protos[1].zoned_timestamp_val.zone == "UTC"
+
+    def test_naive_datetime_treated_as_utc(self):
+        from datetime import datetime, timezone
+
+        dt = datetime(2026, 6, 17, 12, 0, 0)  # naive
+        protos = python_values_to_proto_values([dt], ValueType.ZONED_TIMESTAMP)
+        assert protos[0].zoned_timestamp_val.zone == ""
+        converted = feast_value_type_to_python_type(protos[0])
+        assert converted == dt.replace(tzinfo=timezone.utc)
+
+    def test_null_values(self):
+        protos = python_values_to_proto_values([None], ValueType.ZONED_TIMESTAMP)
+        assert protos[0] == ProtoValue()
+        assert feast_value_type_to_python_type(protos[0]) is None
+
+    def test_value_type_round_trips_to_feast_type(self):
+        from feast.types import ZonedTimestamp, from_value_type
+
+        assert from_value_type(ValueType.ZONED_TIMESTAMP) == ZonedTimestamp
+        assert ZonedTimestamp.to_value_type() == ValueType.ZONED_TIMESTAMP
+
+    def test_fixed_offset_zone_round_trips(self):
+        from datetime import datetime, timedelta, timezone
+
+        # A fixed-offset tzinfo has no IANA key, so _zone_name stores it as an
+        # offset string. Decode must preserve the offset rather than dropping to UTC.
+        offset = timezone(timedelta(hours=-7))
+        dt = datetime(2026, 6, 17, 9, 0, 0, tzinfo=offset)
+        protos = python_values_to_proto_values([dt], ValueType.ZONED_TIMESTAMP)
+
+        converted = feast_value_type_to_python_type(protos[0])
+        # Same instant AND same wall-clock offset preserved.
+        assert converted == dt
+        assert converted.utcoffset() == timedelta(hours=-7)
+        assert converted.hour == 9
+
+    def test_str_to_value_type_resolves_zoned_timestamp(self):
+        from feast.type_map import _convert_value_type_str_to_value_type
+
+        # Must not silently fall back to STRING.
+        assert (
+            _convert_value_type_str_to_value_type("ZONED_TIMESTAMP")
+            == ValueType.ZONED_TIMESTAMP
+        )
+
+    def test_not_supported_as_collection_base_type(self):
+        # ZonedTimestamp has no ZONED_TIMESTAMP_LIST/_SET ValueType, so it must be
+        # rejected as an Array/Set base type rather than KeyError-ing later.
+        from feast.types import Array, Set, ZonedTimestamp
+
+        with pytest.raises(ValueError):
+            Array(ZonedTimestamp)
+        with pytest.raises(ValueError):
+            Set(ZonedTimestamp)

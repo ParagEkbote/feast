@@ -33,7 +33,7 @@ class RestRegistryServer:
     def __init__(self, store: FeatureStore):
         self.store = store
         self.registry = store.registry
-        self.grpc_handler = RegistryServer(self.registry)
+        self.grpc_handler = RegistryServer(self.registry, store=self.store)
         recent_visit_logging_cfg = {}
         feature_server_cfg = getattr(
             getattr(store, "config", None), "feature_server", None
@@ -78,7 +78,7 @@ class RestRegistryServer:
 
         registry_cfg = getattr(store.config, "registry", None)
         mcp_cfg = getattr(registry_cfg, "mcp", None)
-        if mcp_cfg and getattr(mcp_cfg, "enabled", False):
+        if mcp_cfg and getattr(mcp_cfg, "enabled", False) is True:
             try:
                 from fastapi_mcp import FastApiMCP
 
@@ -235,28 +235,35 @@ class RestRegistryServer:
                     else:
                         object_type = None
                         object_name = None
-                    visit = {
-                        "path": path,
-                        "timestamp": _utc_now().isoformat(),
-                        "project": project,
-                        "user": user,
-                        "object": object_type,
-                        "object_name": object_name,
-                        "method": method,
-                    }
-                    try:
-                        visits_json = self.registry.get_project_metadata(project, key)
-                        visits = json.loads(visits_json) if visits_json else []
-                    except Exception:
-                        visits = []
-                    visits.append(visit)
-                    visits = visits[-self.recent_visits_limit :]
-                    try:
-                        self.registry.set_project_metadata(
-                            project, key, json.dumps(visits)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to persist recent visits: {e}")
+
+                    response = await call_next(request)
+
+                    if response.status_code < 400:
+                        visit = {
+                            "path": path,
+                            "timestamp": _utc_now().isoformat(),
+                            "project": project,
+                            "user": user,
+                            "object": object_type,
+                            "object_name": object_name,
+                            "method": method,
+                        }
+                        try:
+                            visits_json = self.registry.get_project_metadata(
+                                project, key
+                            )
+                            visits = json.loads(visits_json) if visits_json else []
+                        except Exception:
+                            visits = []
+                        visits.append(visit)
+                        visits = visits[-self.recent_visits_limit :]
+                        try:
+                            self.registry.set_project_metadata(
+                                project, key, json.dumps(visits)
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to persist recent visits: {e}")
+                    return response
                 response = await call_next(request)
                 return response
 

@@ -104,6 +104,20 @@ _Appears in:_
 Defaults to "feast apply" & "feast materialize-incremental $(date -u +'%Y-%m-%dT%H:%M:%S')" |
 
 
+#### DataQualityMonitoringConfig
+
+
+
+DataQualityMonitoringConfig defines the Data Quality Monitoring configuration.
+
+_Appears in:_
+- [FeatureStoreSpec](#featurestorespec)
+
+| Field | Description |
+| --- | --- |
+| `autoBaseline` _boolean_ | AutoBaseline controls whether baseline distribution is computed automatically on feast apply. Defaults to true. |
+
+
 #### DefaultCtrConfigs
 
 
@@ -255,6 +269,10 @@ Set to an empty array to disable auto-injection. |
 | `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#affinity-v1-core)_ | Affinity defines the pod scheduling constraints for the FeatureStore deployment.
 When scaling is enabled and this is not set, the operator auto-injects a soft
 pod anti-affinity rule to prefer spreading pods across nodes. |
+| `resourceClaims` _[PodResourceClaim](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#podresourceclaim-v1-core) array_ | ResourceClaims defines which ResourceClaims must be allocated
+and reserved before the Pod is allowed to start. The resources
+will be made available to those containers which consume them
+by name. |
 
 
 #### FeatureStoreSpec
@@ -275,6 +293,7 @@ _Appears in:_
 | `authz` _[AuthzConfig](#authzconfig)_ |  |
 | `cronJob` _[FeastCronJob](#feastcronjob)_ |  |
 | `batchEngine` _[BatchEngineConfig](#batchengineconfig)_ |  |
+| `dataQualityMonitoring` _[DataQualityMonitoringConfig](#dataqualitymonitoringconfig)_ | DataQualityMonitoring configures Data Quality Monitoring behaviour. |
 | `replicas` _integer_ | Replicas is the desired number of pod replicas. Used by the scale sub-resource.
 Mutually exclusive with services.scaling.autoscaling. |
 | `materialization` _[MaterializationConfig](#materializationconfig)_ | Materialization controls feature materialization behavior (batch size, pull strategy).
@@ -707,6 +726,31 @@ emit_on_materialize) and transport-specific options (e.g. kafka
 bootstrap_servers, topic; file path). Boolean values ("true"/"false") and
 integer values are automatically coerced to their native YAML types.
 Keys must be valid Feast OpenLineageConfig YAML field names. |
+| `consumer` _[OpenLineageConsumerConfig](#openlineageconsumerconfig)_ | Consumer configures the OpenLineage consumer (event receiver) that enables
+Feast to receive and display lineage from external producers (Airflow, Spark, dbt, etc.). |
+
+
+#### OpenLineageConsumerConfig
+
+
+
+OpenLineageConsumerConfig configures the OpenLineage consumer (event receiver).
+When enabled, the Feast REST server exposes POST /api/v1/lineage to receive
+OpenLineage events from any producer, storing them for visualization in the Feast UI.
+
+_Appears in:_
+- [OpenLineageConfig](#openlineageconfig)
+
+| Field | Description |
+| --- | --- |
+| `enabled` _boolean_ | Enable the OpenLineage consumer. |
+| `storeType` _string_ | StoreType is the storage backend for lineage events. Currently only "sql" is supported. |
+| `connectionStringSecretRef` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#localobjectreference-v1-core)_ | Reference to a Secret containing the key "connection_string" for a separate
+lineage database. If omitted, the SQL registry database is reused. |
+| `apiKeySecretRef` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#localobjectreference-v1-core)_ | Reference to a Secret containing the key "api_key" that producers must
+provide in the X-API-Key header when sending events. |
+| `namespaceMapping` _object (keys:string, values:string)_ | NamespaceMapping maps OpenLineage namespaces to Feast projects for
+RBAC-based filtering of lineage data in the UI. |
 
 
 #### OptionalCtrConfigs

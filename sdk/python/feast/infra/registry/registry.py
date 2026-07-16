@@ -36,6 +36,7 @@ from feast.errors import (
     PermissionNotFoundException,
     ProjectNotFoundException,
     ProjectObjectNotFoundException,
+    SavedDatasetNotFound,
     ValidationReferenceNotFound,
 )
 from feast.feature_service import FeatureService
@@ -45,6 +46,7 @@ from feast.infra.infra_object import Infra
 from feast.infra.registry import proto_registry_utils
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.infra.registry.registry_store import NoopRegistryStore
+from feast.labeling.label_view import LabelView
 from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.permissions.auth_model import AuthConfig, NoAuthConfig
 from feast.permissions.permission import Permission
@@ -56,7 +58,7 @@ from feast.repo_config import RegistryConfig
 from feast.repo_contents import RepoContents
 from feast.saved_dataset import SavedDataset, ValidationReference
 from feast.stream_feature_view import StreamFeatureView
-from feast.utils import _utc_now
+from feast.utils import _utc_now, to_naive_utc
 from feast.version_utils import (
     generate_version_id,
     parse_version,
@@ -89,6 +91,7 @@ class FeastObjectType(Enum):
     FEATURE_VIEW = "feature view"
     ON_DEMAND_FEATURE_VIEW = "on demand feature view"
     STREAM_FEATURE_VIEW = "stream feature view"
+    LABEL_VIEW = "label view"
     FEATURE_SERVICE = "feature service"
     PERMISSION = "permission"
 
@@ -111,6 +114,7 @@ class FeastObjectType(Enum):
             FeastObjectType.STREAM_FEATURE_VIEW: registry.list_stream_feature_views(
                 project=project,
             ),
+            FeastObjectType.LABEL_VIEW: registry.list_label_views(project=project),
             FeastObjectType.FEATURE_SERVICE: registry.list_feature_services(
                 project=project
             ),
@@ -128,6 +132,7 @@ class FeastObjectType(Enum):
             FeastObjectType.FEATURE_VIEW: repo_contents.feature_views,
             FeastObjectType.ON_DEMAND_FEATURE_VIEW: repo_contents.on_demand_feature_views,
             FeastObjectType.STREAM_FEATURE_VIEW: repo_contents.stream_feature_views,
+            FeastObjectType.LABEL_VIEW: repo_contents.label_views,
             FeastObjectType.FEATURE_SERVICE: repo_contents.feature_services,
             FeastObjectType.PERMISSION: repo_contents.permissions,
         }
@@ -150,6 +155,12 @@ def get_registry_store_class_from_type(registry_store_type: str):
 
 def get_registry_store_class_from_scheme(registry_path: str):
     uri = urlparse(registry_path)
+    if uri.scheme == "" or (
+        len(uri.scheme) == 1 and registry_path[1:3] in (":\\", ":/")
+    ):
+        registry_store_type = REGISTRY_STORE_CLASS_FOR_SCHEME["file"]
+        return get_registry_store_class_from_type(registry_store_type)
+
     if uri.scheme not in REGISTRY_STORE_CLASS_FOR_SCHEME:
         raise Exception(
             f"Registry path {registry_path} has unsupported scheme {uri.scheme}. "
@@ -494,7 +505,9 @@ class Registry(BaseRegistry):
         return proto_registry_utils.get_entity(registry_proto, name, project)
 
     def _infer_fv_type_string(self, feature_view) -> str:
-        if isinstance(feature_view, StreamFeatureView):
+        if isinstance(feature_view, LabelView):
+            return "label_view"
+        elif isinstance(feature_view, StreamFeatureView):
             return "stream_feature_view"
         elif isinstance(feature_view, FeatureView):
             return "feature_view"
@@ -507,6 +520,9 @@ class Registry(BaseRegistry):
         from feast.protos.feast.core.FeatureView_pb2 import (
             FeatureView as FeatureViewProto,
         )
+        from feast.protos.feast.core.LabelView_pb2 import (
+            LabelView as LabelViewProto,
+        )
         from feast.protos.feast.core.OnDemandFeatureView_pb2 import (
             OnDemandFeatureView as OnDemandFeatureViewProto,
         )
@@ -514,7 +530,9 @@ class Registry(BaseRegistry):
             StreamFeatureView as StreamFeatureViewProto,
         )
 
-        if fv_type == "stream_feature_view":
+        if fv_type == "label_view":
+            return LabelViewProto, LabelView
+        elif fv_type == "stream_feature_view":
             return StreamFeatureViewProto, StreamFeatureView
         elif fv_type == "feature_view":
             return FeatureViewProto, FeatureView
@@ -550,6 +568,7 @@ class Registry(BaseRegistry):
     ) -> None:
         """Update non-version-significant fields without creating new version."""
         from feast.feature_view import FeatureView
+        from feast.labeling.label_view import LabelView
 
         # Metadata fields
         existing_proto.spec.description = updated_fv.description
@@ -559,7 +578,7 @@ class Registry(BaseRegistry):
         if hasattr(existing_proto.spec, "version") and hasattr(updated_fv, "version"):
             existing_proto.spec.version = getattr(updated_fv, "version")
 
-        # Configuration fields (FeatureView)
+        # Configuration fields (FeatureView / LabelView TTL)
         if (
             hasattr(existing_proto.spec, "ttl")
             and hasattr(updated_fv, "ttl")
@@ -569,6 +588,12 @@ class Registry(BaseRegistry):
                 ttl_duration = updated_fv.get_ttl_duration()
                 if ttl_duration:
                     existing_proto.spec.ttl.CopyFrom(ttl_duration)
+            elif isinstance(updated_fv, LabelView):
+                from google.protobuf.duration_pb2 import Duration
+
+                ttl_duration = Duration()
+                ttl_duration.FromTimedelta(updated_fv.ttl)
+                existing_proto.spec.ttl.CopyFrom(ttl_duration)
         if hasattr(existing_proto.spec, "online") and hasattr(updated_fv, "online"):
             existing_proto.spec.online = getattr(updated_fv, "online")
         if hasattr(existing_proto.spec, "offline") and hasattr(updated_fv, "offline"):
@@ -605,6 +630,23 @@ class Registry(BaseRegistry):
             updated_fv, "singleton"
         ):
             existing_proto.spec.singleton = getattr(updated_fv, "singleton")
+
+        # LabelView-specific configuration
+        if hasattr(existing_proto.spec, "labeler_field") and hasattr(
+            updated_fv, "labeler_field"
+        ):
+            existing_proto.spec.labeler_field = updated_fv.labeler_field
+        if hasattr(existing_proto.spec, "conflict_policy") and hasattr(
+            updated_fv, "conflict_policy"
+        ):
+            existing_proto.spec.conflict_policy = updated_fv.conflict_policy.to_proto()
+
+        if hasattr(existing_proto.spec, "reference_feature_view") and hasattr(
+            updated_fv, "reference_feature_view"
+        ):
+            existing_proto.spec.reference_feature_view = (
+                updated_fv.reference_feature_view or ""
+            )
 
         # Data sources (treat as configuration)
         if (
@@ -780,7 +822,9 @@ class Registry(BaseRegistry):
 
         self._check_conflicting_feature_view_names(feature_view, project)
         existing_feature_views_of_same_type: RepeatedCompositeFieldContainer
-        if isinstance(feature_view, StreamFeatureView):
+        if isinstance(feature_view, LabelView):
+            existing_feature_views_of_same_type = self.cached_registry_proto.label_views
+        elif isinstance(feature_view, StreamFeatureView):
             existing_feature_views_of_same_type = (
                 self.cached_registry_proto.stream_feature_views
             )
@@ -924,6 +968,42 @@ class Registry(BaseRegistry):
             registry_proto, name, project
         )
 
+    def list_label_views(
+        self,
+        project: str,
+        allow_cache: bool = False,
+        tags: Optional[dict[str, str]] = None,
+    ) -> List[LabelView]:
+        registry_proto = self._get_registry_proto(
+            project=project, allow_cache=allow_cache
+        )
+        return proto_registry_utils.list_label_views(registry_proto, project, tags)
+
+    def get_label_view(
+        self, name: str, project: str, allow_cache: bool = False
+    ) -> LabelView:
+        registry_proto = self._get_registry_proto(
+            project=project, allow_cache=allow_cache
+        )
+        return proto_registry_utils.get_label_view(registry_proto, name, project)
+
+    def delete_label_view(self, name: str, project: str, commit: bool = True):
+        self._prepare_registry_for_changes(project)
+        assert self.cached_registry_proto
+
+        for idx, existing_label_view_proto in enumerate(
+            self.cached_registry_proto.label_views
+        ):
+            if (
+                existing_label_view_proto.spec.name == name
+                and existing_label_view_proto.spec.project == project
+            ):
+                del self.cached_registry_proto.label_views[idx]
+                if commit:
+                    self.commit()
+                return
+        raise FeatureViewNotFoundException(name, project)
+
     def get_data_source(
         self, name: str, project: str, allow_cache: bool = False
     ) -> DataSource:
@@ -934,12 +1014,18 @@ class Registry(BaseRegistry):
 
     def apply_materialization(
         self,
-        feature_view: Union[FeatureView, OnDemandFeatureView],
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
         project: str,
         start_date: datetime,
         end_date: datetime,
         commit: bool = True,
     ):
+        if isinstance(feature_view, LabelView):
+            raise ValueError(
+                f"Cannot apply materialization for LabelView {feature_view.name}. "
+                f"Use FeatureStore.push() to write labels."
+            )
+
         self._prepare_registry_for_changes(project)
         assert self.cached_registry_proto
 
@@ -1003,13 +1089,24 @@ class Registry(BaseRegistry):
         allow_cache: bool = False,
         tags: Optional[dict[str, str]] = None,
         skip_udf: bool = False,
+        updated_since: Optional[datetime] = None,
     ) -> List[BaseFeatureView]:
         registry_proto = self._get_registry_proto(
             project=project, allow_cache=allow_cache
         )
-        return proto_registry_utils.list_all_feature_views(
+        feature_views = proto_registry_utils.list_all_feature_views(
             registry_proto, project, tags, skip_udf=skip_udf
         )
+        if updated_since is not None:
+            # last_updated_timestamp from proto is offset-naive UTC; normalise for comparison
+            cutoff = to_naive_utc(updated_since)
+            feature_views = [
+                fv
+                for fv in feature_views
+                if fv.last_updated_timestamp is not None
+                and fv.last_updated_timestamp >= cutoff
+            ]
+        return feature_views
 
     def get_any_feature_view(
         self, name: str, project: str, allow_cache: bool = False
@@ -1109,6 +1206,18 @@ class Registry(BaseRegistry):
                     break
 
         if not found:
+            for idx, existing_label_view_proto in enumerate(
+                self.cached_registry_proto.label_views
+            ):
+                if (
+                    existing_label_view_proto.spec.name == name
+                    and existing_label_view_proto.spec.project == project
+                ):
+                    del self.cached_registry_proto.label_views[idx]
+                    found = True
+                    break
+
+        if not found:
             raise FeatureViewNotFoundException(name, project)
 
         # Clean up version history for the deleted feature view
@@ -1202,6 +1311,23 @@ class Registry(BaseRegistry):
         )
         return proto_registry_utils.list_saved_datasets(registry_proto, project, tags)
 
+    def delete_saved_dataset(self, name: str, project: str, commit: bool = True):
+        self._prepare_registry_for_changes(project)
+        assert self.cached_registry_proto
+
+        for idx, existing_saved_dataset_proto in enumerate(
+            self.cached_registry_proto.saved_datasets
+        ):
+            if (
+                existing_saved_dataset_proto.spec.name == name
+                and existing_saved_dataset_proto.spec.project == project
+            ):
+                del self.cached_registry_proto.saved_datasets[idx]
+                if commit:
+                    self.commit()
+                return
+        raise SavedDatasetNotFound(name, project=project)
+
     def apply_validation_reference(
         self,
         validation_reference: ValidationReference,
@@ -1286,6 +1412,17 @@ class Registry(BaseRegistry):
     def refresh(self, project: Optional[str] = None):
         """Refreshes the state of the registry cache by fetching the registry state from the remote registry store."""
         self._get_registry_proto(project=project, allow_cache=False)
+
+    def is_cache_valid(self) -> bool:
+        if self.cached_registry_proto_created is None:
+            return False
+        if (
+            self.cached_registry_proto_ttl.total_seconds() > 0
+            and _utc_now()
+            > self.cached_registry_proto_created + self.cached_registry_proto_ttl
+        ):
+            return False
+        return True
 
     def teardown(self):
         """Tears down (removes) the registry."""
@@ -1415,7 +1552,8 @@ class Registry(BaseRegistry):
             for fv in self.cached_registry_proto.stream_feature_views
             if fv.spec.project == project
         }
-        return {**odfvs, **fvs, **sfv}
+        lvs = {lv.spec.name: lv for lv in self.cached_registry_proto.label_views}
+        return {**odfvs, **fvs, **sfv, **lvs}
 
     def get_permission(
         self, name: str, project: str, allow_cache: bool = False
@@ -1547,6 +1685,9 @@ class Registry(BaseRegistry):
                 list_feature_views = self.list_feature_views(name)
                 for feature_view in list_feature_views:
                     self.delete_feature_view(feature_view.name, name)
+
+                for lv in self.list_label_views(name):
+                    self.delete_label_view(lv.name, name)
 
                 list_data_sources = self.list_data_sources(name)
                 for data_source in list_data_sources:

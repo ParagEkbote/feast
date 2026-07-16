@@ -337,6 +337,34 @@ def test_feature_views_comprehensive_filtering_via_rest(fastapi_test_app):
     assert len(data["featureViews"]) == 0
 
 
+def test_feature_views_updated_since_via_rest(fastapi_test_app):
+    """Test that feature views can be filtered by updated_since timestamp."""
+    # A timestamp in the past should return all feature views
+    response = fastapi_test_app.get(
+        "/feature_views?project=demo_project&updated_since=2000-01-01T00:00:00Z"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "featureViews" in data
+    all_count = len(data["featureViews"])
+    assert all_count > 0
+
+    # A timestamp far in the future should return no feature views
+    response = fastapi_test_app.get(
+        "/feature_views?project=demo_project&updated_since=2999-01-01T00:00:00Z"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "featureViews" in data
+    assert len(data["featureViews"]) == 0
+
+    # Without updated_since returns the same count as the past-timestamp query
+    response = fastapi_test_app.get("/feature_views?project=demo_project")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["featureViews"]) == all_count
+
+
 def test_feature_services_via_rest(fastapi_test_app):
     response = fastapi_test_app.get("/feature_services?project=demo_project")
     assert response.status_code == 200
@@ -2091,8 +2119,16 @@ def test_apply_and_delete_feature_view_via_rest(fastapi_test_app):
             "project": "demo_project",
             "entities": ["user_id"],
             "features": [
-                {"name": "trip_count", "value_type": 2},
-                {"name": "avg_rating", "value_type": 4},
+                {
+                    "name": "trip_count",
+                    "value_type": 2,
+                    "description": "Number of completed trips",
+                },
+                {
+                    "name": "avg_rating",
+                    "value_type": 4,
+                    "description": "Average driver rating",
+                },
             ],
             "ttl_seconds": 86400,
             "online": True,
@@ -2107,7 +2143,10 @@ def test_apply_and_delete_feature_view_via_rest(fastapi_test_app):
     # Verify it exists
     response = fastapi_test_app.get("/feature_views/driver_stats?project=demo_project")
     assert response.status_code == 200
-    assert response.json()["spec"]["name"] == "driver_stats"
+    spec = response.json()["spec"]
+    assert spec["name"] == "driver_stats"
+    assert spec["features"][0]["description"] == "Number of completed trips"
+    assert spec["features"][1]["description"] == "Average driver rating"
 
     # Delete it
     response = fastapi_test_app.delete(

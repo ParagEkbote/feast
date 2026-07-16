@@ -33,6 +33,7 @@ from feast.infra.utils.snowflake.snowflake_utils import (
     GetSnowflakeConnection,
     execute_snowflake_statement,
 )
+from feast.labeling.label_view import LabelView
 from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.permissions.permission import Permission
 from feast.project import Project
@@ -44,6 +45,7 @@ from feast.protos.feast.core.FeatureService_pb2 import (
 )
 from feast.protos.feast.core.FeatureView_pb2 import FeatureView as FeatureViewProto
 from feast.protos.feast.core.InfraObject_pb2 import Infra as InfraProto
+from feast.protos.feast.core.LabelView_pb2 import LabelView as LabelViewProto
 from feast.protos.feast.core.OnDemandFeatureView_pb2 import (
     OnDemandFeatureView as OnDemandFeatureViewProto,
 )
@@ -60,7 +62,7 @@ from feast.protos.feast.core.ValidationProfile_pb2 import (
 from feast.repo_config import RegistryConfig
 from feast.saved_dataset import SavedDataset, ValidationReference
 from feast.stream_feature_view import StreamFeatureView
-from feast.utils import _utc_now, has_all_tags
+from feast.utils import _utc_now, has_all_tags, to_naive_utc
 
 logger = logging.getLogger(__name__)
 
@@ -405,7 +407,7 @@ class SnowflakeRegistry(BaseRegistry):
                             VALUES
                             ('{name}', '{project}', CURRENT_TIMESTAMP(), TO_BINARY({proto}), '', '')
                     """
-                elif "_FEATURE_VIEWS" in table:
+                elif "_FEATURE_VIEWS" in table or table == "LABEL_VIEWS":
                     query = f"""
                         INSERT INTO {self.registry_path}."{table}"
                             VALUES
@@ -462,17 +464,16 @@ class SnowflakeRegistry(BaseRegistry):
             FeatureServiceNotFoundException,
         )
 
-    # can you have featureviews with the same name
     def delete_feature_view(self, name: str, project: str, commit: bool = True):
         deleted_count = 0
-        for table in {
-            "FEATURE_VIEWS",
-            "ON_DEMAND_FEATURE_VIEWS",
-            "STREAM_FEATURE_VIEWS",
-        }:
-            deleted_count += self._delete_object(
-                table, name, project, "FEATURE_VIEW_NAME", None
-            )
+        _FV_TABLE_ID_COLUMNS = {
+            "FEATURE_VIEWS": "FEATURE_VIEW_NAME",
+            "ON_DEMAND_FEATURE_VIEWS": "FEATURE_VIEW_NAME",
+            "STREAM_FEATURE_VIEWS": "FEATURE_VIEW_NAME",
+            "LABEL_VIEWS": "LABEL_VIEW_NAME",
+        }
+        for table, id_col in _FV_TABLE_ID_COLUMNS.items():
+            deleted_count += self._delete_object(table, name, project, id_col, None)
         if deleted_count == 0:
             raise FeatureViewNotFoundException(name, project)
 
@@ -634,6 +635,17 @@ class SnowflakeRegistry(BaseRegistry):
                 OnDemandFeatureView,
                 "ON_DEMAND_FEATURE_VIEW_NAME",
                 "ON_DEMAND_FEATURE_VIEW_PROTO",
+                None,
+            )
+        if not fv:
+            fv = self._get_object(
+                "LABEL_VIEWS",
+                name,
+                project,
+                LabelViewProto,
+                LabelView,
+                "LABEL_VIEW_NAME",
+                "LABEL_VIEW_PROTO",
                 FeatureViewNotFoundException,
             )
         return fv
@@ -644,14 +656,24 @@ class SnowflakeRegistry(BaseRegistry):
         allow_cache: bool = False,
         tags: Optional[dict[str, str]] = None,
         skip_udf: bool = False,
+        updated_since: Optional[datetime] = None,
     ) -> List[BaseFeatureView]:
         if allow_cache:
             registry_proto = self._refresh_cached_registry_if_necessary()
-            return proto_registry_utils.list_all_feature_views(
+            feature_views = proto_registry_utils.list_all_feature_views(
                 registry_proto, project, tags, skip_udf=skip_udf
             )
+            if updated_since is not None:
+                cutoff = to_naive_utc(updated_since)
+                feature_views = [
+                    fv
+                    for fv in feature_views
+                    if fv.last_updated_timestamp is not None
+                    and fv.last_updated_timestamp >= cutoff
+                ]
+            return feature_views
 
-        return (
+        feature_views = (
             cast(
                 list[BaseFeatureView],
                 self.list_feature_views(project, allow_cache, tags, skip_udf=skip_udf),
@@ -668,7 +690,22 @@ class SnowflakeRegistry(BaseRegistry):
                     project, allow_cache, tags, skip_udf=skip_udf
                 ),
             )
+            + cast(
+                list[BaseFeatureView],
+                self.list_label_views(project, allow_cache, tags),
+            )
         )
+
+        if updated_since is not None:
+            cutoff = to_naive_utc(updated_since)
+            feature_views = [
+                fv
+                for fv in feature_views
+                if fv.last_updated_timestamp is not None
+                and fv.last_updated_timestamp >= cutoff
+            ]
+
+        return feature_views
 
     def get_infra(self, project: str, allow_cache: bool = False) -> Infra:
         infra_object = self._get_object(
@@ -945,6 +982,50 @@ class SnowflakeRegistry(BaseRegistry):
             tags=tags,
         )
 
+    def get_label_view(
+        self, name: str, project: str, allow_cache: bool = False
+    ) -> LabelView:
+        if allow_cache:
+            registry_proto = self._refresh_cached_registry_if_necessary()
+            return proto_registry_utils.get_label_view(registry_proto, name, project)
+        return self._get_object(
+            "LABEL_VIEWS",
+            name,
+            project,
+            LabelViewProto,
+            LabelView,
+            "LABEL_VIEW_NAME",
+            "LABEL_VIEW_PROTO",
+            FeatureViewNotFoundException,
+        )
+
+    def list_label_views(
+        self,
+        project: str,
+        allow_cache: bool = False,
+        tags: Optional[dict[str, str]] = None,
+    ) -> List[LabelView]:
+        if allow_cache:
+            registry_proto = self._refresh_cached_registry_if_necessary()
+            return proto_registry_utils.list_label_views(registry_proto, project, tags)
+        return self._list_objects(
+            "LABEL_VIEWS",
+            project,
+            LabelViewProto,
+            LabelView,
+            "LABEL_VIEW_PROTO",
+            tags=tags,
+        )
+
+    def delete_label_view(self, name: str, project: str, commit: bool = True):
+        self._delete_object(
+            "LABEL_VIEWS",
+            name,
+            project,
+            "LABEL_VIEW_NAME",
+            FeatureViewNotFoundException,
+        )
+
     def list_validation_references(
         self,
         project: str,
@@ -1029,7 +1110,7 @@ class SnowflakeRegistry(BaseRegistry):
 
     def apply_materialization(
         self,
-        feature_view: Union[FeatureView, OnDemandFeatureView],
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
         project: str,
         start_date: datetime,
         end_date: datetime,
@@ -1039,7 +1120,7 @@ class SnowflakeRegistry(BaseRegistry):
         fv_column_name = fv_table_str[:-1]
         python_class, proto_class = self._infer_fv_classes(feature_view)
 
-        if python_class in {OnDemandFeatureView}:
+        if python_class in {OnDemandFeatureView, LabelView}:
             raise ValueError(
                 f"Cannot apply materialization for feature {feature_view.name} of type {python_class}"
             )
@@ -1232,6 +1313,13 @@ class SnowflakeRegistry(BaseRegistry):
                     "PERMISSION_PROTO",
                     r.permissions,
                 ),
+                (
+                    "LABEL_VIEWS",
+                    LabelViewProto,
+                    LabelView,
+                    "LABEL_VIEW_PROTO",
+                    r.label_views,
+                ),
             ]:
                 objs = self._list_objects(
                     table,
@@ -1282,7 +1370,9 @@ class SnowflakeRegistry(BaseRegistry):
         return datetime.fromtimestamp(int(df.squeeze()), tz=timezone.utc)
 
     def _infer_fv_classes(self, feature_view):
-        if isinstance(feature_view, StreamFeatureView):
+        if isinstance(feature_view, LabelView):
+            python_class, proto_class = LabelView, LabelViewProto
+        elif isinstance(feature_view, StreamFeatureView):
             python_class, proto_class = StreamFeatureView, StreamFeatureViewProto
         elif isinstance(feature_view, FeatureView):
             python_class, proto_class = FeatureView, FeatureViewProto
@@ -1293,7 +1383,9 @@ class SnowflakeRegistry(BaseRegistry):
         return python_class, proto_class
 
     def _infer_fv_table(self, feature_view) -> str:
-        if isinstance(feature_view, StreamFeatureView):
+        if isinstance(feature_view, LabelView):
+            table = "LABEL_VIEWS"
+        elif isinstance(feature_view, StreamFeatureView):
             table = "STREAM_FEATURE_VIEWS"
         elif isinstance(feature_view, FeatureView):
             table = "FEATURE_VIEWS"
@@ -1391,6 +1483,7 @@ class SnowflakeRegistry(BaseRegistry):
                     "FEATURE_VIEWS",
                     "ON_DEMAND_FEATURE_VIEWS",
                     "STREAM_FEATURE_VIEWS",
+                    "LABEL_VIEWS",
                     "DATA_SOURCES",
                     "ENTITIES",
                     "PERMISSIONS",
