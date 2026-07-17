@@ -4,11 +4,6 @@ from typing import Any, Dict, Optional
 from feast.data_source import DataSource
 from feast.protos.feast.core.DataSource_pb2 import DataSource as DataSourceProto
 from feast.repo_config import RepoConfig
-from feast.type_map import (
-    feast_value_type_to_python_type,
-)
-
-from google.protobuf.duration_pb2 import Duration
 
 
 @dataclass

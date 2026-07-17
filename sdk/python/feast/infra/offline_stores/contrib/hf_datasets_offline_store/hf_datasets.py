@@ -23,7 +23,6 @@ from feast.saved_dataset import SavedDatasetStorage
 
 from .hf_datasets_source import HFDatasetSource
 
-
 # =============================================================================
 # Retrieval Job
 # =============================================================================
