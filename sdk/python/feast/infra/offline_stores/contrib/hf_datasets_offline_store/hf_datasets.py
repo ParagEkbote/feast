@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import duckdb
+from feast.type_map import hf_to_feast_value_type
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -46,17 +47,7 @@ class HFDatasetsRetrievalJob(RetrievalJob):
         full_feature_names: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Initialize a lazy historical retrieval job.
-
-        Args:
-            evaluation_function: Zero-argument callable that executes the
-                retrieval query and returns a ``pyarrow.Table``. Only invoked
-                once, on first access, and cached thereafter.
-            full_feature_names: Whether feature columns are prefixed with
-                their feature view name (``<view>__<feature>``).
-            metadata: Optional lineage metadata (feature refs, project,
-                retrieval timestamp, etc.) attached to this job.
-        """
+        """Initialize the retrieval job."""
         self._evaluation_function = evaluation_function
         self._full_feature_names = full_feature_names
         self._metadata = metadata or {}
@@ -68,11 +59,7 @@ class HFDatasetsRetrievalJob(RetrievalJob):
     # -------------------------------------------------------------------------
 
     def _evaluate_arrow(self) -> pa.Table:
-        """Run the evaluation function once and cache the result.
-
-        Returns:
-            The retrieved data as a ``pyarrow.Table``.
-        """
+        """Evaluate the retrieval once and cache the result."""
         if self._arrow_table is None:
             self._arrow_table = self._evaluation_function()
 
@@ -83,42 +70,15 @@ class HFDatasetsRetrievalJob(RetrievalJob):
     # -------------------------------------------------------------------------
 
     def to_arrow(self) -> pa.Table:
-        """Return the retrieval result as a ``pyarrow.Table``.
-
-        Returns:
-            The retrieved data as a ``pyarrow.Table``.
-        """
+        """Return the retrieval result as a pyarrow table."""
         return self._evaluate_arrow()
 
     def to_df(self) -> pd.DataFrame:
-        """Return the retrieval result as a pandas DataFrame.
-
-        Returns:
-            The retrieved data as a ``pandas.DataFrame``.
-        """
+        """Return the retrieval result as a pandas DataFrame."""
         return self.to_arrow().to_pandas()
 
     def to_remote_storage(self, path: str, **kwargs: Any) -> List[str]:
-        """Write the retrieval result to a remote storage location.
-
-        Supports scalable batch materialization by allowing a custom
-        Materialization Engine to distribute the reading and writing of
-        offline store records to blob storage. Writes a single Parquet
-        file via ``pyarrow.parquet``, which supports any filesystem
-        registered with ``fsspec`` (e.g. local paths, ``s3://``, ``gs://``).
-
-        Args:
-            path: Destination path or URI to write the Parquet file to.
-            **kwargs: Additional keyword arguments forwarded to
-                ``pyarrow.parquet.write_table``.
-
-        Returns:
-            A list containing the single output path written.
-
-        Note:
-            This is a minimal, single-file implementation. For very large
-            materializations, consider chunked/partitioned writes instead.
-        """
+        """Write the retrieval result to a remote Parquet path."""
         table = self.to_arrow()
         pq.write_table(table, path, **kwargs)
         return [path]
@@ -128,28 +88,16 @@ class HFDatasetsRetrievalJob(RetrievalJob):
     # -------------------------------------------------------------------------
 
     def to_hf_dataset(self) -> Dataset:
-        """Export the retrieval result as a Hugging Face ``Dataset``.
-
-        Returns:
-            The retrieved data as a ``datasets.Dataset``.
-        """
+        """Export the retrieval result as a Hugging Face Dataset."""
         return Dataset(self.to_arrow())
 
     def save_to_disk(self, path: str) -> None:
-        """Save the retrieval result to disk as an HF dataset artifact.
-
-        Args:
-            path: Local directory path to save the dataset to.
-        """
+        """Save the retrieval result to disk as an HF dataset."""
         dataset = self.to_hf_dataset()
         dataset.save_to_disk(path)
 
     def to_parquet(self, path: str) -> None:
-        """Export the retrieval result to a Parquet file.
-
-        Args:
-            path: Destination path for the Parquet file.
-        """
+        """Export the retrieval result to a Parquet file."""
         self.to_hf_dataset().to_parquet(path)
 
     # -------------------------------------------------------------------------
@@ -163,19 +111,7 @@ class HFDatasetsRetrievalJob(RetrievalJob):
         license: str = "apache-2.0",
         tags: Optional[List[str]] = None,
     ) -> str:
-        """Generate a Hugging Face dataset card (README.md) for this result.
-
-        Args:
-            title: Dataset card title. Defaults to a generic Feast title.
-            description: Dataset card description. Defaults to a generic
-                description referencing Feast historical retrieval.
-            license: SPDX license identifier for the dataset card metadata.
-            tags: Tags to include in the dataset card metadata. Defaults to
-                ``["feast", "feature-store", "datasets"]``.
-
-        Returns:
-            The rendered dataset card as a Markdown string.
-        """
+        """Generate a dataset card for the retrieval result."""
         dataset = self.to_hf_dataset()
 
         schema_lines = []
@@ -241,28 +177,7 @@ tags:
         exist_ok: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Push the retrieval result to the Hugging Face Hub.
-
-        Creates the destination dataset repo if it doesn't exist, optionally
-        generates and uploads a dataset card, and uploads the dataset
-        artifact.
-
-        Args:
-            repo_id: Target Hub repo ID, e.g. ``"username/dataset-name"``.
-            split: Split name to associate with the uploaded data.
-            private: Whether to create the repo as private.
-            token: HF auth token. Falls back to the environment/cached
-                token if not provided.
-            generate_card: Whether to generate and upload a README.md
-                dataset card alongside the data.
-            card_title: Title for the generated dataset card.
-            card_description: Description for the generated dataset card.
-            card_license: License identifier for the generated dataset card.
-            card_tags: Tags for the generated dataset card.
-            exist_ok: Whether to silently reuse an existing repo instead of
-                raising an error.
-            **kwargs: Reserved for future use.
-        """
+        """Upload the retrieval result to the Hugging Face Hub."""
         dataset = self.to_hf_dataset()
 
         api = HfApi(token=token)
@@ -321,12 +236,7 @@ tags:
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        """Lineage metadata attached to this retrieval job.
-
-        Returns:
-            A dict of metadata such as feature refs, project name, and
-            retrieval timestamp.
-        """
+        """Return metadata attached to this retrieval job."""
         return self._metadata
 
 
@@ -336,22 +246,9 @@ tags:
 
 
 class HFDatasetsOfflineStoreConfig(FeastConfigBaseModel):
-    """Configuration for the Hugging Face Datasets offline store.
+    """Configuration for the Hugging Face Datasets offline store."""
 
-    Referenced from a feature repo's ``feature_store.yaml`` under the
-    ``offline_store`` key. Currently has no store-specific settings beyond
-    the required ``type`` discriminator; per-dataset configuration (path,
-    split, revision, etc.) lives on ``HFDatasetSource`` instead.
-
-    Attributes:
-        type: Fully qualified class path of the offline store implementation
-            this config belongs to. Feast uses this to dynamically import
-            and instantiate the correct ``OfflineStore`` class.
-    """
-
-    type: Literal[
-        "feast.infra.offline_stores.contrib.hf_datasets_offline_store.hf_datasets.HFDatasetsOfflineStore"
-    ] = "feast.infra.offline_stores.contrib.hf_datasets_offline_store.hf_datasets.HFDatasetsOfflineStore"
+    type: Literal["hf_datasets"] = "hf_datasets"
 
 
 # =============================================================================
@@ -360,17 +257,7 @@ class HFDatasetsOfflineStoreConfig(FeastConfigBaseModel):
 
 
 class HFDatasetsOfflineStore(OfflineStore):
-    """Feast OfflineStore implementation backed by Hugging Face Datasets.
-
-    Execution pipeline for historical retrieval and materialization pulls:
-
-        HF Dataset -> Arrow -> DuckDB (date filter / PIT join / dedup)
-            -> Arrow Result -> HF Dataset Artifact
-
-    All read paths load the underlying dataset via ``datasets.load_dataset``
-    and use an in-process DuckDB connection to perform filtering, joins, and
-    deduplication with SQL, rather than doing so in pandas.
-    """
+    """Offline store implementation backed by Hugging Face Datasets."""
 
     @staticmethod
     def pull_latest_from_table_or_query(
@@ -383,41 +270,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
-        """Pull the latest feature values per entity for materialization.
-
-        Invoked by ``feast materialize`` / ``feast materialize-incremental``.
-        Filters rows to the ``[start_date, end_date]`` window on
-        ``timestamp_field``, then deduplicates per entity (per
-        ``join_key_columns``) keeping only the most recent row. When
-        ``created_timestamp_column`` is present it is used as the primary
-        tie-breaker for recency (falling back to ``timestamp_field``);
-        otherwise ``timestamp_field`` alone determines recency.
-
-        Args:
-            config: The RepoConfig for the current feature store.
-            data_source: The data source to pull from. Must be an
-                ``HFDatasetSource``.
-            join_key_columns: Entity join key column names to deduplicate on.
-            feature_name_columns: Feature column names to select.
-            timestamp_field: Event timestamp column used for filtering and
-                recency ordering.
-            created_timestamp_column: Optional created-timestamp column used
-                as the primary tie-breaker when multiple rows share the same
-                ``timestamp_field`` value.
-            start_date: Inclusive lower bound on ``timestamp_field``.
-            end_date: Inclusive upper bound on ``timestamp_field``.
-
-        Returns:
-            A ``RetrievalJob`` that lazily evaluates to the deduplicated
-            Arrow table.
-
-        Raises:
-            TypeError: If ``data_source`` is not an ``HFDatasetSource``.
-            NotImplementedError: If the data source is configured for
-                streaming.
-            ValueError: If ``timestamp_field`` is missing from the loaded
-                dataset.
-        """
+        """Return the latest values per entity for materialization."""
         if not isinstance(data_source, HFDatasetSource):
             raise TypeError(f"Expected HFDatasetSource, got {type(data_source)}")
 
@@ -454,26 +307,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         start_date: datetime,
         end_date: datetime,
     ) -> pa.Table:
-        """Load, filter, and deduplicate a dataset for materialization.
-
-        Args:
-            source: The HFDatasetSource to load data from.
-            join_key_columns: Entity join key column names to deduplicate on.
-            feature_name_columns: Feature column names to select.
-            timestamp_field: Event timestamp column used for filtering and
-                recency ordering.
-            created_timestamp_column: Optional created-timestamp column used
-                as the primary tie-breaker for recency.
-            start_date: Inclusive lower bound on ``timestamp_field``.
-            end_date: Inclusive upper bound on ``timestamp_field``.
-
-        Returns:
-            The deduplicated result as a ``pyarrow.Table``.
-
-        Raises:
-            ValueError: If ``timestamp_field`` is missing from the loaded
-                dataset, or if ``join_key_columns`` is empty.
-        """
+        """Load, filter, and deduplicate rows for materialization."""
         dataset = HFDatasetsOfflineStore._load_dataset(source)
         df = dataset.to_pandas()
 
@@ -525,33 +359,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         start_date: datetime,
         end_date: datetime,
     ) -> RetrievalJob:
-        """Pull all rows within a date range, without deduplication.
-
-        Used for ``SavedDataset`` creation and data quality monitoring
-        validation, where every observed row in the window is needed rather
-        than just the latest value per entity.
-
-        Args:
-            config: The RepoConfig for the current feature store.
-            data_source: The data source to pull from. Must be an
-                ``HFDatasetSource``.
-            join_key_columns: Entity join key column names to select.
-            feature_name_columns: Feature column names to select.
-            timestamp_field: Event timestamp column used for filtering.
-            start_date: Inclusive lower bound on ``timestamp_field``.
-            end_date: Inclusive upper bound on ``timestamp_field``.
-
-        Returns:
-            A ``RetrievalJob`` that lazily evaluates to the filtered,
-            un-deduplicated Arrow table.
-
-        Raises:
-            TypeError: If ``data_source`` is not an ``HFDatasetSource``.
-            NotImplementedError: If the data source is configured for
-                streaming.
-            ValueError: If ``timestamp_field`` is missing from the loaded
-                dataset.
-        """
+        """Return rows in a time range without deduplication."""
         if not isinstance(data_source, HFDatasetSource):
             raise TypeError(f"Expected HFDatasetSource, got {type(data_source)}")
 
@@ -586,23 +394,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         start_date: datetime,
         end_date: datetime,
     ) -> pa.Table:
-        """Load and date-filter a dataset without deduplication.
-
-        Args:
-            source: The HFDatasetSource to load data from.
-            join_key_columns: Entity join key column names to select.
-            feature_name_columns: Feature column names to select.
-            timestamp_field: Event timestamp column used for filtering.
-            start_date: Inclusive lower bound on ``timestamp_field``.
-            end_date: Inclusive upper bound on ``timestamp_field``.
-
-        Returns:
-            The filtered result as a ``pyarrow.Table``.
-
-        Raises:
-            ValueError: If ``timestamp_field`` is missing from the loaded
-                dataset.
-        """
+        """Load and filter rows without deduplication."""
         dataset = HFDatasetsOfflineStore._load_dataset(source)
         df = dataset.to_pandas()
 
@@ -639,28 +431,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         project: str,
         full_feature_names: bool = False,
     ) -> RetrievalJob:
-        """Perform a point-in-time correct join of features onto an entity df.
-
-        This is the main entry point used by
-        ``FeatureStore.get_historical_features()`` to retrieve training data.
-
-        Args:
-            config: The RepoConfig for the current feature store.
-            feature_views: Feature views referenced by ``feature_refs``.
-            feature_refs: Feature references to retrieve, in
-                ``<feature_view>:<feature>`` form.
-            entity_df: Entity dataframe (or path to a Parquet file containing
-                one) with entity keys and event timestamps to join features
-                onto.
-            registry: The Feast registry.
-            project: The feature store project name.
-            full_feature_names: Whether to prefix feature columns with their
-                feature view name in the output.
-
-        Returns:
-            A ``RetrievalJob`` that lazily evaluates to the joined Arrow
-            table.
-        """
+        """Run historical feature retrieval for the provided entity data."""
         def evaluate() -> pa.Table:
             return HFDatasetsOfflineStore._run_historical_retrieval(
                 feature_views=feature_views,
@@ -689,27 +460,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         entity_df: Union[pd.DataFrame, str],
         full_feature_names: bool = False,
     ) -> pa.Table:
-        """Execute the point-in-time join across all feature views using DuckDB.
-
-        Args:
-            feature_views: Feature views to join onto the entity dataframe.
-            entity_df: Entity dataframe, or a path to a Parquet file
-                containing one.
-            full_feature_names: Whether to prefix feature columns with their
-                feature view name in the output.
-
-        Returns:
-            The joined result as a ``pyarrow.Table``.
-
-        Raises:
-            TypeError: If ``entity_df`` is not a DataFrame or Parquet path,
-                or if a feature view's batch source is not an
-                ``HFDatasetSource``.
-            NotImplementedError: If a feature view's source is configured
-                for streaming.
-            ValueError: If a source doesn't define ``timestamp_field``, or
-                ``timestamp_field`` is missing from the loaded dataset.
-        """
+        """Join feature views onto entity rows using point-in-time logic."""
         if isinstance(entity_df, str):
             entity_df = pd.read_parquet(entity_df)
 
@@ -828,14 +579,7 @@ class HFDatasetsOfflineStore(OfflineStore):
 
     @staticmethod
     def _load_dataset(source: HFDatasetSource) -> Dataset:
-        """Load a Hugging Face dataset for the given source configuration.
-
-        Args:
-            source: The HFDatasetSource describing what to load.
-
-        Returns:
-            The loaded ``datasets.Dataset``.
-        """
+        """Load a Hugging Face dataset from the given source."""
         return load_dataset(
             path=source.path,
             split=source.split,
@@ -858,44 +602,10 @@ class HFDatasetsOfflineStore(OfflineStore):
         table,
         progress,
     ) -> None:
-        """Write a pyarrow table directly to this feature view's batch source.
-
-        Supports the Feast push API for offline writes. Not yet implemented.
-
-        Args:
-            config: The RepoConfig for the current feature store.
-            feature_view: The feature view being written to.
-            table: The pyarrow table of feature values to write.
-            progress: Optional progress callback.
-
-        Raises:
-            NotImplementedError: Always, until implemented.
-        """
+        """Write a batch table to the offline store."""
         raise NotImplementedError("offline_write_batch is not implemented yet.")
 
     @staticmethod
-    def write_logged_features(
-        config: RepoConfig,
-        data,
-        source: SavedDatasetStorage,
-        logging_config,
-        registry,
-    ) -> None:
-        """Write logged features for a SavedDataset to this offline store.
-
-        Used internally to support feature logging for SavedDatasets. Not
-        yet implemented.
-
-        Args:
-            config: The RepoConfig for the current feature store.
-            data: A pyarrow table, or a path to a Parquet file, containing
-                the logged feature data.
-            source: The LoggingSource/SavedDatasetStorage destination.
-            logging_config: The LoggingConfig describing how logging is set
-                up.
-            registry: The Feast registry.
-
-        Raises:
-            NotImplementedError: Always, until implemented.
-        """
+    def  source_datatype_to_feast_value_type():
+        """Write logged features to the offline store."""
         raise NotImplementedError("write_logged_features is not implemented yet.")
