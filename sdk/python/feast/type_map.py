@@ -2389,39 +2389,85 @@ def convert_array_column(series: pd.Series, value_type: ValueType) -> pd.Series:
     return series.apply(convert_array_item)
 
 def hf_to_feast_value_type(dtype: str) -> ValueType:
-    type_map = {
-        "bool": ValueType.BOOL,
-        "int8": ValueType.INT32,
-        "uint8": ValueType.INT32,
-        "int16": ValueType.INT32,
-        "uint16": ValueType.INT32,
-        "int32": ValueType.INT32,
-        "uint32": ValueType.INT64,
-        "int64": ValueType.INT64,
-        "uint64": ValueType.INT64,
-        "float16": ValueType.FLOAT,
-        "float32": ValueType.FLOAT,
-        "float64": ValueType.DOUBLE,
-        "string": ValueType.STRING,
-        "binary": ValueType.BYTES,
-        "timestamp": ValueType.UNIX_TIMESTAMP,
-        "date32": ValueType.UNIX_TIMESTAMP,
-        "date64": ValueType.UNIX_TIMESTAMP,
-        "array<bool>": ValueType.BOOL_LIST,
-        "array<int32>": ValueType.INT32_LIST,
-        "array<int64>": ValueType.INT64_LIST,
-        "array<float32>": ValueType.FLOAT_LIST,
-        "array<float64>": ValueType.DOUBLE_LIST,
-        "array<string>": ValueType.STRING_LIST,
-    }
+    """Convert a Hugging Face / PyArrow dtype string to a Feast ValueType."""
 
     if not isinstance(dtype, str):
         return ValueType.NULL
 
-    if dtype.startswith("timestamp") or dtype.startswith("date32") or dtype.startswith("date64"):
-        return ValueType.UNIX_TIMESTAMP
+    dtype = dtype.strip()
 
-    if dtype not in type_map:
-        raise ValueError(f"Unsupported HuggingFace dtype: {dtype}")
-    
-    return type_map[dtype]
+    scalar_type_map = {
+        # Boolean
+        "bool": ValueType.BOOL,
+
+        # Signed integers
+        "int8": ValueType.INT32,
+        "int16": ValueType.INT32,
+        "int32": ValueType.INT32,
+        "int64": ValueType.INT64,
+
+        # Unsigned integers
+        "uint8": ValueType.INT32,
+        "uint16": ValueType.INT32,
+        "uint32": ValueType.INT64,
+        "uint64": ValueType.INT64,
+
+        # Floating point
+        "float16": ValueType.FLOAT,
+        "float32": ValueType.FLOAT,
+        "float64": ValueType.DOUBLE,
+
+        # Strings / bytes
+        "string": ValueType.STRING,
+        "large_string": ValueType.STRING,
+        "binary": ValueType.BYTES,
+        "large_binary": ValueType.BYTES,
+
+        # Temporal
+        "timestamp": ValueType.UNIX_TIMESTAMP,
+        "date32": ValueType.UNIX_TIMESTAMP,
+        "date64": ValueType.UNIX_TIMESTAMP,
+        "time32[s]": ValueType.UNIX_TIMESTAMP,
+        "time32[ms]": ValueType.UNIX_TIMESTAMP,
+        "time64[us]": ValueType.UNIX_TIMESTAMP,
+        "time64[ns]": ValueType.UNIX_TIMESTAMP,
+
+        # Durations
+        "duration[s]": ValueType.INT64,
+        "duration[ms]": ValueType.INT64,
+        "duration[us]": ValueType.INT64,
+        "duration[ns]": ValueType.INT64,
+
+        # Decimals
+        "decimal128": ValueType.DOUBLE,
+        "decimal256": ValueType.DOUBLE,
+    }
+
+    list_type_map = {
+        ValueType.BOOL: ValueType.BOOL_LIST,
+        ValueType.INT32: ValueType.INT32_LIST,
+        ValueType.INT64: ValueType.INT64_LIST,
+        ValueType.FLOAT: ValueType.FLOAT_LIST,
+        ValueType.DOUBLE: ValueType.DOUBLE_LIST,
+        ValueType.STRING: ValueType.STRING_LIST,
+    }
+
+    for pattern in (
+        r"array<(.+)>",
+        r"list<(.+)>",
+        r"large_list<(.+)>",
+        r"fixed_size_list<(.+)>",
+    ):
+        match = re.fullmatch(pattern, dtype)
+        if match:
+            element_type = hf_to_feast_value_type(match.group(1).strip())
+            if element_type in list_type_map:
+                return list_type_map[element_type]
+            raise ValueError(
+                f"Unsupported list element type: {match.group(1)}"
+            )
+
+    if dtype in scalar_type_map:
+        return scalar_type_map[dtype]
+
+    raise ValueError(f"Unsupported Hugging Face dtype: {dtype}")

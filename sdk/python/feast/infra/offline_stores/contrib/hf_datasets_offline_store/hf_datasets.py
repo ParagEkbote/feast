@@ -14,15 +14,11 @@ from huggingface_hub import HfApi
 
 from feast.data_source import DataSource
 from feast.feature_view import FeatureView
-from feast.infra.offline_stores.offline_store import (
-    OfflineStore,
-    RetrievalJob,
-)
+from feast.infra.offline_stores.offline_store import OfflineStore, RetrievalJob
 from feast.repo_config import FeastConfigBaseModel, RepoConfig
 from feast.saved_dataset import SavedDatasetStorage
 
 from .hf_datasets_source import HFDatasetSource
-
 
 # =============================================================================
 # Retrieval Job
@@ -497,6 +493,29 @@ class HFDatasetsOfflineStore(OfflineStore):
         return pa.Table.from_pandas(dataset.to_pandas())
 
     @staticmethod
+    def _build_timestamp_predicates(
+        timestamp_field: str,
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
+    ) -> tuple[List[str], List[Any]]:
+        predicates: List[str] = []
+        params: List[Any] = []
+
+        if start_date is not None:
+            predicates.append(
+                f"CAST({timestamp_field} AS TIMESTAMP) >= CAST(? AS TIMESTAMP)"
+            )
+            params.append(start_date)
+
+        if end_date is not None:
+            predicates.append(
+                f"CAST({timestamp_field} AS TIMESTAMP) <= CAST(? AS TIMESTAMP)"
+            )
+            params.append(end_date)
+
+        return predicates, params
+
+    @staticmethod
     def _pull_latest(
         source: HFDatasetSource,
         join_key_columns: List[str],
@@ -552,12 +571,18 @@ class HFDatasetsOfflineStore(OfflineStore):
         )
         partition_by_sql = ", ".join(join_key_columns)
 
+        predicates, params = HFDatasetsOfflineStore._build_timestamp_predicates(
+            timestamp_field,
+            start_date,
+            end_date,
+        )
+        where_clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+
         query = f"""
         SELECT {select_columns_sql}
         FROM (
             SELECT {select_columns_sql}
-            FROM source_table
-            WHERE CAST({timestamp_field} AS TIMESTAMP) BETWEEN CAST(? AS TIMESTAMP) AND CAST(? AS TIMESTAMP)
+            FROM source_table{where_clause}
         )
         QUALIFY ROW_NUMBER() OVER (
             PARTITION BY {partition_by_sql}
@@ -565,7 +590,7 @@ class HFDatasetsOfflineStore(OfflineStore):
         ) = 1
         """
 
-        result_table = con.execute(query, [start_date, end_date]).to_arrow_table()
+        result_table = con.execute(query, params).to_arrow_table()
 
         return result_table
 
@@ -615,9 +640,6 @@ class HFDatasetsOfflineStore(OfflineStore):
         if data_source.streaming:
             raise NotImplementedError("Streaming datasets are not yet supported.")
 
-        if start_date is None or end_date is None:
-            raise ValueError("start_date and end_date are required for pull_all_from_table_or_query.")
-
         def evaluate() -> pa.Table:
             return HFDatasetsOfflineStore._pull_all(
                 source=data_source,
@@ -633,8 +655,8 @@ class HFDatasetsOfflineStore(OfflineStore):
             evaluation_function=evaluate,
             metadata={
                 "source_path": data_source.path,
-                "start_date": start_date.isoformat(),
-                "end_date": end_date.isoformat(),
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
             },
         )
 
@@ -644,8 +666,8 @@ class HFDatasetsOfflineStore(OfflineStore):
         join_key_columns: List[str],
         feature_name_columns: List[str],
         timestamp_field: str,
-        start_date: datetime,
-        end_date: datetime,
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
         created_timestamp_column: Optional[str] = None,
     ) -> pa.Table:
         """Load and date-filter a dataset without deduplication.
@@ -681,13 +703,19 @@ class HFDatasetsOfflineStore(OfflineStore):
             select_columns.append(created_timestamp_column)
         select_columns_sql = ", ".join(select_columns)
 
+        predicates, params = HFDatasetsOfflineStore._build_timestamp_predicates(
+            timestamp_field,
+            start_date,
+            end_date,
+        )
+        where_clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+
         query = f"""
         SELECT {select_columns_sql}
-        FROM source_table
-        WHERE CAST({timestamp_field} AS TIMESTAMP) BETWEEN CAST(? AS TIMESTAMP) AND CAST(? AS TIMESTAMP)
+        FROM source_table{where_clause}
         """
 
-        result_table = con.execute(query, [start_date, end_date]).to_arrow_table()
+        result_table = con.execute(query, params).to_arrow_table()
 
         return result_table
 
@@ -914,10 +942,13 @@ class HFDatasetsOfflineStore(OfflineStore):
         """
         return load_dataset(
             path=source.path,
+            name=source.config_name,
             split=source.split,
             revision=source.revision,
-            streaming=source.streaming,
+            data_dir=source.data_dir,
             data_files=source.data_files,
+            streaming=source.streaming,
+            storage_options=source.storage_options,
             cache_dir=source.cache_dir,
             token=source.token,
             **source.load_dataset_kwargs,
@@ -975,3 +1006,4 @@ class HFDatasetsOfflineStore(OfflineStore):
             NotImplementedError: Always, until implemented.
         """
         raise NotImplementedError("write_logged_features is not implemented yet.")
+
