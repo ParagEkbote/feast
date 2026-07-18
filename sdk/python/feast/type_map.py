@@ -2391,28 +2391,22 @@ def convert_array_column(series: pd.Series, value_type: ValueType) -> pd.Series:
 def hf_to_feast_value_type(dtype: str) -> ValueType:
     type_map = {
         "bool": ValueType.BOOL,
-
         "int8": ValueType.INT32,
         "uint8": ValueType.INT32,
         "int16": ValueType.INT32,
         "uint16": ValueType.INT32,
         "int32": ValueType.INT32,
-
         "uint32": ValueType.INT64,
         "int64": ValueType.INT64,
         "uint64": ValueType.INT64,
-
         "float16": ValueType.FLOAT,
         "float32": ValueType.FLOAT,
         "float64": ValueType.DOUBLE,
-
         "string": ValueType.STRING,
         "binary": ValueType.BYTES,
-
         "timestamp": ValueType.UNIX_TIMESTAMP,
         "date32": ValueType.UNIX_TIMESTAMP,
         "date64": ValueType.UNIX_TIMESTAMP,
-
         "array<bool>": ValueType.BOOL_LIST,
         "array<int32>": ValueType.INT32_LIST,
         "array<int64>": ValueType.INT64_LIST,
@@ -2424,5 +2418,10 @@ def hf_to_feast_value_type(dtype: str) -> ValueType:
     if not isinstance(dtype, str):
         return ValueType.NULL
 
+    if dtype.startswith("timestamp") or dtype.startswith("date32") or dtype.startswith("date64"):
+        return ValueType.UNIX_TIMESTAMP
+
     if dtype not in type_map:
         raise ValueError(f"Unsupported HuggingFace dtype: {dtype}")
+    
+    return type_map[dtype]
